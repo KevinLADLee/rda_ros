@@ -1,20 +1,27 @@
 #! /usr/bin/env python
 
-import numpy as np
-import rospy
-from geometry_msgs.msg import Twist, PoseStamped, Point
-from costmap_converter.msg import ObstacleArrayMsg
-from nav_msgs.msg import Path
-from visualization_msgs.msg import Marker, MarkerArray
-import tf
-from collections import namedtuple
-from RDA_planner.mpc import MPC
-from math import atan2
-from gctl.curve_generator import curve_generator
-from sklearn.cluster import DBSCAN
-from sensor_msgs.msg import LaserScan
 import cv2
-from math import cos, sin
+import numpy as np
+from collections import namedtuple
+from math import atan2, cos, sin
+from sklearn.cluster import DBSCAN
+
+import rclpy
+from rclpy.node import Node
+import rclpy.publisher
+import rclpy.time
+from tf2_ros import TransformException
+from tf2_ros.buffer import Buffer
+from tf2_ros.transform_listener import TransformListener
+from geometry_msgs.msg import Twist, PoseStamped, Point
+from nav_msgs.msg import Path
+from sensor_msgs.msg import LaserScan
+from visualization_msgs.msg import Marker, MarkerArray
+
+from costmap_converter_msgs.msg import ObstacleArrayMsg
+
+from RDA_planner.mpc import MPC
+from gctl.curve_generator import curve_generator
 
 robot_tuple = namedtuple(
     "robot_tuple", "G h cone_type wheelbase max_speed max_acce dynamics"
@@ -24,89 +31,100 @@ rda_obs_tuple = namedtuple(
 )  # vertex: 2*number of vertex
 
 
-class rda_core:
+class rda_core(Node):
     def __init__(self) -> None:
+        super().__init__('rda_node')
 
         # publish topics
-        self.vel_pub = rospy.Publisher("/rda_cmd_vel", Twist, queue_size=10)
-        self.rda_path_pub = rospy.Publisher("/rda_opt_path", Path, queue_size=10)
-
-        self.ref_path_pub = rospy.Publisher("/rda_ref_path", Path, queue_size=10)
-        self.ref_states_pub = rospy.Publisher("/rda_ref_states", Path, queue_size=10)
-        self.obs_pub = rospy.Publisher("/rda_obs_markers", MarkerArray, queue_size=10)
-
-        rospy.init_node("rda_node", anonymous=True)
-
-        # ros parameters
+        self.vel_pub = self.create_publisher(Twist, '/rda_cmd_vel', 10)
+        self.rda_path_pub = self.create_publisher(Path, '/rda_opt_path', 10)
+        self.ref_path_pub = self.create_publisher(Path, '/rda_ref_path', 10)
+        self.ref_states_pub = self.create_publisher(Path, '/rda_ref_states', 10)
+        self.obs_pub = self.create_publisher(MarkerArray, '/rda_obs_markers', 10)
 
         ## robot info
-        robot_info = rospy.get_param(
-            "~robot_info",
-            {
-                "vertices": None,
-                "radius": None,
-                "max_speed": [10, 1],
-                "max_acce": [10, 0.5],
-                "length": 2,
-                "width": 1,
-                "wheelbase": 1.5,
-                "dynamics": "diff",
-                "cone_type": "Rpositive",
-            },
+        self.declare_parameters(
+            namespace='',
+            parameters=[
+            ("robot_info.vertices", []),
+            ("robot_info.radius", []),
+            ("robot_info.max_speed", [10.0, 1.0]),
+            ("robot_info.max_acce", [10.0, 0.5]),
+            ("robot_info.length", 2),
+            ("robot_info.width", 1),
+            ("robot_info.wheelbase", 1.5),
+            ("robot_info.dynamics", "diff"),
+            ("robot_info.cone_type", "Rpositive"),
+            ]
         )
 
+        robot_info = {
+            "vertices": self.get_parameter("robot_info.vertices").get_parameter_value().double_array_value,
+            "radius": self.get_parameter("robot_info.radius").get_parameter_value().double_value,
+            "max_speed": self.get_parameter("robot_info.max_speed").get_parameter_value().double_array_value,
+            "max_acce": self.get_parameter("robot_info.max_acce").get_parameter_value().double_array_value,
+            "length": self.get_parameter("robot_info.length").get_parameter_value().double_value,
+            "width": self.get_parameter("robot_info.width").get_parameter_value().double_value,
+            "wheelbase": self.get_parameter("robot_info.wheelbase").get_parameter_value().double_value,
+            "dynamics": self.get_parameter("robot_info.dynamics").get_parameter_value().string_value,
+            "cone_type": self.get_parameter("robot_info.cone_type").get_parameter_value().string_value,
+        }
+
         ## For rda MPC
-        receding = rospy.get_param("~receding", 10)
-        iter_num = rospy.get_param("~iter_num", 2)
-        enable_reverse = rospy.get_param("~enable_reverse", False)
-        sample_time = rospy.get_param("~sample_time", 0.1)
-        process_num = rospy.get_param("~process_num", 4)
-        accelerated = rospy.get_param("~accelerated", True)
-        time_print = rospy.get_param("~time_print", False)
-        obstacle_order = rospy.get_param("~obstacle_order", True)
-        self.max_edge_num = rospy.get_param("~max_edge_num", 5)
-        self.max_obstacle_num = rospy.get_param("~max_obs_num", 5)
-        self.goal_index_threshold = rospy.get_param("~goal_index_threshold", 1)
+        receding = self.get_parameter_or("receding", 10)
+        iter_num = self.get_parameter_or("iter_num", 2)
+        enable_reverse = self.get_parameter_or("enable_reverse", False).get_parameter_value().bool_value
+        sample_time = self.get_parameter_or("sample_time", 0.1).get_parameter_value().double_value
+        process_num = self.get_parameter_or("process_num", 4).get_parameter_value().integer_value
+        accelerated = self.get_parameter_or("accelerated", True).get_parameter_value().bool_value
+        time_print = self.get_parameter_or("time_print", False).get_parameter_value().bool_value
+        obstacle_order = self.get_parameter_or("obstacle_order", True).get_parameter_value().bool_value
+        self.max_edge_num = self.get_parameter_or("max_edge_num", 5).get_parameter_value().integer_value
+        self.max_obstacle_num = self.get_parameter_or("max_obs_num", 5).get_parameter_value().integer_value
+        self.goal_index_threshold = self.get_parameter_or("goal_index_threshold", 1).get_parameter_value().integer_value
 
         ## Tune parameters
-        iter_threshold = rospy.get_param("~iter_threshold", 0.2)
-        slack_gain = rospy.get_param("~slack_gain", 8)
-        max_sd = rospy.get_param("~max_sd", 1.0)
-        min_sd = rospy.get_param("~min_sd", 0.1)
-        ws = rospy.get_param("~ws", 1.0)
-        wu = rospy.get_param("~wu", 0.5)
-        ro1 = rospy.get_param("~ro1", 200)
-        ro2 = rospy.get_param("~ro2", 1.0)
+        iter_threshold = self.get_parameter_or("iter_threshold", 0.2).get_parameter_value().double_value
+        slack_gain = self.get_parameter_or("slack_gain", 8).get_parameter_value().integer_value
+        max_sd = self.get_parameter_or("max_sd", 1.0).get_parameter_value().double_value
+        min_sd = self.get_parameter_or("min_sd", 0.1).get_parameter_value().double_value
+        ws = self.get_parameter_or("ws", 1.0).get_parameter_value().double_value
+        wu = self.get_parameter_or("wu", 0.5).get_parameter_value().double_value
+        ro1 = self.get_parameter_or("ro1", 200).get_parameter_value().integer_value
+        ro2 = self.get_parameter_or("ro2", 1.0).get_parameter_value().double_value
 
         # reference speed
-        self.ref_speed = rospy.get_param("~ref_speed", 4.0)  # ref speed
+        self.ref_speed = self.get_parameter_or("ref_speed", 4.0).get_parameter_value().double_value  # ref speed
 
         ## for scan
-        use_scan_obstacle = rospy.get_param("~use_scan_obstacle", False)
-        self.scan_eps = rospy.get_param("~scan_eps", 0.2)
-        self.scan_min_samples = rospy.get_param("~scan_min_samples", 6)
+        use_scan_obstacle = self.get_parameter_or("use_scan_obstacle", False).get_parameter_value().bool_value
+        self.scan_eps = self.get_parameter_or("scan_eps", 0.2).get_parameter_value().double_value
+        self.scan_min_samples = self.get_parameter_or("scan_min_samples", 6).get_parameter_value().integer_value
 
         ## for reference paths
-        self.waypoints = rospy.get_param("~waypoints", [])
-        self.loop = rospy.get_param("~loop", False)
-        self.curve_type = rospy.get_param("~curve_type", "dubins")
-        self.step_size = rospy.get_param("~step_size", 0.1)
-        self.min_radius = rospy.get_param("~min_radius", 1.0)
+        self.waypoints = self.get_parameter_or("waypoints", []).get_parameter_value().double_array_value
+        self.loop = self.get_parameter_or("loop", False).get_parameter_value().bool_value
+        self.curve_type = self.get_parameter_or("curve_type", "dubins").get_parameter_value().string_value
+        self.step_size = self.get_parameter_or("step_size", 0.1).get_parameter_value().double_value
+        self.min_radius = self.get_parameter_or("min_radius", 1.0).get_parameter_value().double_value
 
         ## for frame
-        self.target_frame = rospy.get_param("~target_frame", "map")
-        self.lidar_frame = rospy.get_param("~lidar_frame", "lidar_link")
-        self.base_frame = rospy.get_param("~base_frame", "base_link")
+        self.target_frame = self.get_parameter_or("target_frame", "map").get_parameter_value().string_value
+        self.lidar_frame = self.get_parameter_or("lidar_frame", "lidar_link").get_parameter_value().string_value
+        self.base_frame = self.get_parameter_or("base_frame", "base_link").get_parameter_value().string_value
 
         # for visualization
-        self.marker_x = rospy.get_param("~marker_x", 0.05)
-        self.marker_lifetime = rospy.get_param("~marker_lifetime", 0.1)
+        self.marker_x = self.get_parameter_or("marker_x", 0.05).get_parameter_value().double_value
+        self.marker_lifetime = self.get_parameter_or("marker_lifetime", 0.1).get_parameter_value().double_value
+
+        # init tf
+        self.tf_buffer = Buffer()
+        self.listener = TransformListener(self.tf_buffer, self)
 
         # initialize
         self.robot_state = None
         self.obstacle_list = []
         self.cg = curve_generator()
-        self.listener = tf.TransformListener()
         self.ref_path_list = (
             self.generate_ref_path_list()
         )  # generate the initial reference path
@@ -137,39 +155,34 @@ class rda_core:
             ro2=ro2,
         )
 
-        rospy.Subscriber("/rda_goal", PoseStamped, self.goal_callback)
-        rospy.Subscriber("/rda_sub_path", Path, self.path_callback)
-        self.listener = tf.TransformListener()
+        self.create_subscription(PoseStamped, "/rda_goal", self.goal_callback, 10)
+        self.create_subscription(Path, "/rda_sub_path", self.path_callback, 10)
 
         # Topic Subscribe
         if not use_scan_obstacle:
-            rospy.Subscriber("/rda_obstacles", ObstacleArrayMsg, self.obstacle_callback)
+            self.create_subscription(ObstacleArrayMsg, "/rda_obstacles", self.obstacle_callback, 10)
         else:
-            rospy.Subscriber("/scan", LaserScan, self.scan_callback)
+            self.create_subscription(LaserScan, "/scan", self.scan_callback, 10)
 
     def control(self):
+        rate = self.create_rate(50)
 
-        rate = rospy.Rate(50)
-
-        while not rospy.is_shutdown():
+        while rclpy.ok():
 
             self.read_robot_state()
 
             if self.robot_state is None:
-                rospy.loginfo_throttle(1, "waiting for robot states")
+                self.get_logger().info("waiting for robot states", throttle_duration_sec=1)
                 continue
 
             if len(self.obstacle_list) == 0:
-                rospy.loginfo_throttle(1, "No obstacles, perform path tracking")
+                self.get_logger().info("No obstacles, perform path tracking", throttle_duration_sec=1)
             else:
                 rda_obs_markers = self.convert_to_markers(self.obstacle_list)
                 self.obs_pub.publish(rda_obs_markers)
 
             if self.rda_opt.no_ref_path():
-
-                rospy.loginfo_throttle(
-                    1, "waiting for reference path, topic '/rda_sub_path' "
-                )
+                self.get_logger().info("waiting for reference path, topic '/rda_sub_path'", throttle_duration_sec=1)
                 continue
 
             else:
@@ -217,24 +230,18 @@ class rda_core:
     def read_robot_state(self):
 
         try:
-            (trans, rot) = self.listener.lookupTransform(
-                self.target_frame, self.base_frame, rospy.Time(0)
+            trans = self.tf_buffer.lookup_transform(
+            self.target_frame, self.base_frame, rclpy.time.Time()
             )
-            # print(trans, rot)
-            yaw = self.quat_to_yaw_list(rot)
-            x, y = trans[0], trans[1]
+            yaw = self.quat_to_yaw(trans.transform.rotation)
+            x = trans.transform.translation.x
+            y = trans.transform.translation.y
             self.robot_state = np.array([x, y, yaw]).reshape(3, 1)
 
-        except (
-            tf.LookupException,
-            tf.ConnectivityException,
-            tf.ExtrapolationException,
-        ):
-            rospy.loginfo_throttle(
-                1,
-                "waiting for tf for the transform from {} to {}".format(
-                    self.base_frame, self.target_frame
-                ),
+        except TransformException as ex:
+            self.get_logger().info(
+            f"Could not transform {self.base_frame} to {self.target_frame}: {ex}",
+            throttle_duration_sec=1,
             )
 
     def obstacle_callback(self, obstacle_array):
@@ -242,7 +249,7 @@ class rda_core:
         temp_obs_list = []
 
         if self.max_obstacle_num == 0:
-            rospy.loginfo_once(1, "No obstacles are considered")
+            self.get_logger().info("No obstacles are considered")
             return
 
         for obstacles in obstacle_array.obstacles:
@@ -300,13 +307,13 @@ class rda_core:
             self.ref_path_list.append(points)
 
         if len(self.ref_path_list) == 0:
-            rospy.loginfo_throttle(
-                1,
+            self.get_logger().info(
                 "No waypoints are converted to reference path, waiting for new waypoints",
+                throttle_duration_sec=1,
             )
             return
 
-        rospy.loginfo_throttle(0.1, "reference path update")
+        self.get_logger().info("reference path update", throttle_duration_sec=0.1)
         self.rda_opt.update_ref_path(self.ref_path_list)
 
     def goal_callback(self, goal):
@@ -327,13 +334,13 @@ class rda_core:
         )
 
         if len(self.ref_path_list) == 0:
-            rospy.loginfo_throttle(
-                1,
-                "No waypoints are converted to reference path, waiting for new waypoints",
+            self.get_logger().info(
+            "No waypoints are converted to reference path, waiting for new waypoints",
+            throttle_duration_sec=1,
             )
             return
 
-        rospy.loginfo_throttle(0.1, "reference path update")
+        self.get_logger().info("reference path update", throttle_duration_sec=0.1)
         self.rda_opt.update_ref_path(self.ref_path_list)
 
     def scan_callback(self, scan_data):
@@ -354,7 +361,7 @@ class rda_core:
                 point_list.append(point)
 
         if len(point_list) < 3 or self.robot_state is None:
-            rospy.loginfo_throttle(1, "No obstacles are converted to polygon")
+            self.get_logger().info("No obstacles are converted to polygon", throttle_duration_sec=1)
             return
 
         else:
@@ -362,7 +369,7 @@ class rda_core:
             # get the transform from lidar to target frame
             try:
                 trans, rot = self.listener.lookupTransform(
-                    self.target_frame, self.lidar_frame, rospy.Time(0)
+                    self.target_frame, self.lidar_frame, rclpy.time.Time()
                 )
 
                 yaw = self.quat_to_yaw_list(rot)
@@ -371,15 +378,11 @@ class rda_core:
                 l_trans, l_R = self.get_transform(np.array([x, y, yaw]).reshape(3, 1))
 
             except (
-                tf.LookupException,
-                tf.ConnectivityException,
-                tf.ExtrapolationException,
+                TransformException
             ):
-                rospy.loginfo_throttle(
-                    1,
-                    "waiting for tf for the transform from {} to {}".format(
-                        self.lidar_frame, self.target_frame
-                    ),
+                self.get_logger().info(
+                    f"waiting for tf for the transform from {self.lidar_frame} to {self.target_frame}",
+                    throttle_duration_sec=1,
                 )
                 return
 
@@ -433,14 +436,14 @@ class rda_core:
             marker = Marker()
             marker.header.frame_id = self.target_frame
 
-            marker.header.stamp = rospy.get_rostime()
+            marker.header.stamp = self.get_clock().now()
 
             marker.color.a = 1.0
             marker.color.r = 0.0
             marker.color.g = 0.0
             marker.color.b = 1.0
 
-            marker.lifetime = rospy.Duration(self.marker_lifetime)
+            marker.lifetime = rclpy.time.Duration(self.marker_lifetime)
 
             # breakpoint()
 
@@ -483,14 +486,14 @@ class rda_core:
         path = Path()
 
         path.header.seq = 0
-        path.header.stamp = rospy.get_rostime()
+        path.header.stamp = self.get_clock().now()
         path.header.frame_id = self.target_frame
 
         for i in range(len(state_list)):
             ps = PoseStamped()
 
             ps.header.seq = i
-            ps.header.stamp = rospy.get_rostime()
+            ps.header.stamp = self.get_clock().now()
             ps.header.frame_id = self.target_frame
 
             ps.pose.position.x = state_list[i][0, 0]
